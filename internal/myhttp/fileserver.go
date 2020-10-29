@@ -21,8 +21,8 @@ import (
 	"github.com/patrickhener/goshs/internal/myca"
 	"github.com/patrickhener/goshs/internal/myclipboard"
 	"github.com/patrickhener/goshs/internal/mylog"
-	"github.com/patrickhener/goshs/internal/mysock"
 	"github.com/patrickhener/goshs/internal/myutils"
+	"github.com/patrickhener/goshs/internal/mywebsock"
 
 	"github.com/phogolabs/parcello"
 
@@ -68,7 +68,7 @@ type FileServer struct {
 	MyCert     string
 	BasicAuth  string
 	Version    string
-	Hub        *mysock.Hub
+	Hub        *mywebsock.Hub
 	Clipboard  *myclipboard.Clipboard
 }
 
@@ -128,7 +128,7 @@ func (fs *FileServer) Start() {
 	fs.Clipboard = myclipboard.New()
 
 	// init websocket hub
-	fs.Hub = mysock.NewHub(fs.Clipboard)
+	fs.Hub = mywebsock.NewHub(fs.Clipboard)
 	go fs.Hub.Run()
 
 	// Check BasicAuth and use middleware
@@ -180,7 +180,7 @@ func (fs *FileServer) Start() {
 
 // socket will handle the socket connection
 func (fs *FileServer) socket(w http.ResponseWriter, req *http.Request) {
-	mysock.ServeWS(fs.Hub, w, req)
+	mywebsock.ServeWS(fs.Hub, w, req)
 }
 
 // clipboardAdd will handle the add request for adding text to the clipboard

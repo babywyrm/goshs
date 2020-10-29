@@ -1,4 +1,4 @@
-package mysock
+package mywebsock
 
 import "github.com/patrickhener/goshs/internal/myclipboard"
 
