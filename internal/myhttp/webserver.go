@@ -2,6 +2,7 @@ package myhttp
 
 import (
 	"archive/zip"
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
@@ -20,6 +21,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/patrickhener/goshs/internal/myca"
 	"github.com/patrickhener/goshs/internal/myclipboard"
+	"github.com/patrickhener/goshs/internal/myconfig"
 	"github.com/patrickhener/goshs/internal/mylog"
 	"github.com/patrickhener/goshs/internal/myutils"
 	"github.com/patrickhener/goshs/internal/mywebsock"
@@ -57,19 +59,16 @@ type item struct {
 	SortLastModified    time.Time
 }
 
-// FileServer holds the fileserver information
-type FileServer struct {
-	IP         string
-	Port       int
-	Webroot    string
-	SSL        bool
-	SelfSigned bool
-	MyKey      string
-	MyCert     string
-	BasicAuth  string
-	Version    string
-	Hub        *mywebsock.Hub
-	Clipboard  *myclipboard.Clipboard
+// WebServer holds the WebServer information
+type WebServer struct {
+	IP           string
+	Port         int
+	Webroot      string
+	SharedConfig *myconfig.SharedConfig
+	Version      string
+	Hub          *mywebsock.Hub
+	Clipboard    *myclipboard.Clipboard
+	HTTPServer   *http.Server
 }
 
 type httperror struct {
@@ -80,7 +79,7 @@ type httperror struct {
 }
 
 // BasicAuthMiddleware is a middleware to handle the basic auth
-func (fs *FileServer) BasicAuthMiddleware(next http.Handler) http.Handler {
+func (ws *WebServer) BasicAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
 
@@ -90,7 +89,7 @@ func (fs *FileServer) BasicAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if username != "gopher" || password != fs.BasicAuth {
+		if username != "gopher" || password != ws.SharedConfig.Pass {
 			http.Error(w, "Not authorized", http.StatusUnauthorized)
 			return
 		}
@@ -101,21 +100,21 @@ func (fs *FileServer) BasicAuthMiddleware(next http.Handler) http.Handler {
 }
 
 // Start will start the file server
-func (fs *FileServer) Start() {
+func (ws *WebServer) Start() error {
 	// Setup routing with gorilla/mux
 	mux := mux.NewRouter()
-	mux.PathPrefix("/425bda8487e36deccb30dd24be590b8744e3a28a8bb5a57d9b3fcd24ae09ad3c/").HandlerFunc(fs.static)
+	mux.PathPrefix("/425bda8487e36deccb30dd24be590b8744e3a28a8bb5a57d9b3fcd24ae09ad3c/").HandlerFunc(ws.static)
 	// Websocket
-	mux.PathPrefix("/14644be038ea0118a1aadfacca2a7d1517d7b209c4b9674ee893b1944d1c2d54/ws").HandlerFunc(fs.socket)
+	mux.PathPrefix("/14644be038ea0118a1aadfacca2a7d1517d7b209c4b9674ee893b1944d1c2d54/ws").HandlerFunc(ws.socket)
 	// Clipboard
-	mux.PathPrefix("/14644be038ea0118a1aadfacca2a7d1517d7b209c4b9674ee893b1944d1c2d54/download").HandlerFunc(fs.cbDown)
-	mux.PathPrefix("/cf985bddf28fed5d5c53b069d6a6ebe601088ca6e20ec5a5a8438f8e1ffd9390/").HandlerFunc(fs.bulkDownload)
-	mux.Methods(http.MethodPost).HandlerFunc(fs.upload)
-	mux.PathPrefix("/").HandlerFunc(fs.handler)
+	mux.PathPrefix("/14644be038ea0118a1aadfacca2a7d1517d7b209c4b9674ee893b1944d1c2d54/download").HandlerFunc(ws.cbDown)
+	mux.PathPrefix("/cf985bddf28fed5d5c53b069d6a6ebe601088ca6e20ec5a5a8438f8e1ffd9390/").HandlerFunc(ws.bulkDownload)
+	mux.Methods(http.MethodPost).HandlerFunc(ws.upload)
+	mux.PathPrefix("/").HandlerFunc(ws.handler)
 
 	// construct server
-	add := fmt.Sprintf("%+v:%+v", fs.IP, fs.Port)
-	server := http.Server{
+	add := fmt.Sprintf("%+v:%+v", ws.IP, ws.Port)
+	ws.HTTPServer = &http.Server{
 		Addr:    add,
 		Handler: mux,
 		// Good practice: enforce timeouts for servers you create!
@@ -125,74 +124,87 @@ func (fs *FileServer) Start() {
 	}
 
 	// init clipboard
-	fs.Clipboard = myclipboard.New()
+	ws.Clipboard = myclipboard.New()
 
 	// init websocket hub
-	fs.Hub = mywebsock.NewHub(fs.Clipboard)
-	go fs.Hub.Run()
+	ws.Hub = mywebsock.NewHub(ws.Clipboard)
+	go ws.Hub.Run()
 
 	// Check BasicAuth and use middleware
-	if fs.BasicAuth != "" {
-		if !fs.SSL {
-			log.Printf("WARNING!: You are using basic auth without SSL. Your credentials will be transferred in cleartext. Consider using -s, too.\n")
+	if ws.SharedConfig.Pass != "" {
+		if !ws.SharedConfig.TLS {
+			log.Printf("WARNING!: You are using basic auth without TLS. Your credentials will be transferred in cleartext. Consider using -t, too.\n")
 		}
-		log.Printf("Using 'gopher:%+v' as basic auth\n", fs.BasicAuth)
+		log.Printf("Using 'gopher:%+v' as basic auth\n", ws.SharedConfig.Pass)
 		// Use middleware
-		mux.Use(fs.BasicAuthMiddleware)
+		mux.Use(ws.BasicAuthMiddleware)
 	}
 
-	// Check if ssl
-	if fs.SSL {
+	// Check if TLS
+	if ws.SharedConfig.TLS {
 		// Check if selfsigned
-		if fs.SelfSigned {
-			serverTLSConf, fingerprint256, fingerprint1, err := myca.Setup()
+		if ws.SharedConfig.SelfSigned {
+			var (
+				err            error
+				fingerprint256 string
+				fingerprint1   string
+			)
+			ws.SharedConfig.TLSConfig, fingerprint256, fingerprint1, err = myca.Setup()
 			if err != nil {
-				log.Fatalf("Unable to start SSL enabled server: %+v\n", err)
+				log.Printf("Unable to start TLS enabled server: %+v\n", err)
+				return err
 			}
-			server.TLSConfig = serverTLSConf
-			log.Printf("Serving HTTPS on %+v port %+v from %+v with ssl enabled and self-signed certificate\n", fs.IP, fs.Port, fs.Webroot)
+			ws.HTTPServer.TLSConfig = ws.SharedConfig.TLSConfig
+			log.Printf("Serving HTTPS on %+v port %+v from %+v with TLS enabled and self-signed certificate\n", ws.IP, ws.Port, ws.Webroot)
 			log.Println("WARNING! Be sure to check the fingerprint of certificate")
 			log.Printf("SHA-256 Fingerprint: %+v\n", fingerprint256)
 			log.Printf("SHA-1   Fingerprint: %+v\n", fingerprint1)
-			log.Panic(server.ListenAndServeTLS("", ""))
-		} else {
-			if fs.MyCert == "" || fs.MyKey == "" {
-				log.Fatalln("You need to provide server.key and server.crt if -s and not -ss")
-			}
-
-			fingerprint256, fingerprint1, err := myca.ParseAndSum(fs.MyCert)
-			if err != nil {
-				log.Fatalf("Unable to start SSL enabled server: %+v\n", err)
-			}
-
-			log.Printf("Serving HTTPS on %+v port %+v from %+v with ssl enabled server key: %+v, server cert: %+v\n", fs.IP, fs.Port, fs.Webroot, fs.MyKey, fs.MyCert)
-			log.Println("INFO! You provided a certificate and might want to check the fingerprint nonetheless")
-			log.Printf("SHA-256 Fingerprint: %+v\n", fingerprint256)
-			log.Printf("SHA-1   Fingerprint: %+v\n", fingerprint1)
-
-			log.Panic(server.ListenAndServeTLS(fs.MyCert, fs.MyKey))
+			log.Panic(ws.HTTPServer.ListenAndServeTLS("", ""))
+			return nil
 		}
-	} else {
-		log.Printf("Serving HTTP on %+v port %+v from %+v\n", fs.IP, fs.Port, fs.Webroot)
-		log.Panic(server.ListenAndServe())
+		if ws.SharedConfig.Cert == "" || ws.SharedConfig.Key == "" {
+			log.Fatalln("You need to provide server.key and server.crt if -t and not -ss")
+		}
+
+		fingerprint256, fingerprint1, err := myca.ParseAndSum(ws.SharedConfig.Cert)
+		if err != nil {
+			log.Printf("Unable to start TLS enabled server: %+v\n", err)
+			return err
+		}
+
+		log.Printf("Serving HTTPS on %+v port %+v from %+v with TLS enabled server key: %+v, server cert: %+v\n", ws.IP, ws.Port, ws.Webroot, ws.SharedConfig.Key, ws.SharedConfig.Cert)
+		log.Println("INFO! You provided a certificate and might want to check the fingerprint nonetheless")
+		log.Printf("SHA-256 Fingerprint: %+v\n", fingerprint256)
+		log.Printf("SHA-1   Fingerprint: %+v\n", fingerprint1)
+
+		log.Panic(ws.HTTPServer.ListenAndServeTLS(ws.SharedConfig.Cert, ws.SharedConfig.Key))
+		return nil
 	}
+	log.Printf("Serving HTTP on %+v port %+v from %+v\n", ws.IP, ws.Port, ws.Webroot)
+	log.Panic(ws.HTTPServer.ListenAndServe())
+	return nil
+}
+
+// Stop will gracefully shutdown the web server
+func (ws *WebServer) Stop(ctx context.Context) {
+	ws.HTTPServer.Shutdown(ctx)
 }
 
 // socket will handle the socket connection
-func (fs *FileServer) socket(w http.ResponseWriter, req *http.Request) {
-	mywebsock.ServeWS(fs.Hub, w, req)
+func (ws *WebServer) socket(w http.ResponseWriter, req *http.Request) {
+	mywebsock.ServeWS(ws.Hub, w, req)
 }
 
 // clipboardAdd will handle the add request for adding text to the clipboard
-func (fs *FileServer) cbDown(w http.ResponseWriter, req *http.Request) {
+func (ws *WebServer) cbDown(w http.ResponseWriter, req *http.Request) {
 	filename := fmt.Sprintf("%+v-clipboard.json", int32(time.Now().Unix()))
 	contentDisposition := fmt.Sprintf("attachment; filename=\"%s\"", filename)
 	// Handle as download
 	w.Header().Add("Content-Type", "application/octet-stream")
 	w.Header().Add("Content-Disposition", contentDisposition)
-	content, err := fs.Clipboard.Download()
+	content, err := ws.Clipboard.Download()
 	if err != nil {
-		fs.handleError(w, req, err, 500)
+		ws.handleError(w, req, err, 500)
 	}
 
 	if _, err := w.Write(content); err != nil {
@@ -201,7 +213,7 @@ func (fs *FileServer) cbDown(w http.ResponseWriter, req *http.Request) {
 }
 
 // static will give static content for style and function
-func (fs *FileServer) static(w http.ResponseWriter, req *http.Request) {
+func (ws *WebServer) static(w http.ResponseWriter, req *http.Request) {
 	// Check which file to serve
 	upath := req.URL.Path
 	staticPath := strings.SplitAfterN(upath, "/", 3)[2]
@@ -228,7 +240,7 @@ func (fs *FileServer) static(w http.ResponseWriter, req *http.Request) {
 }
 
 // handler is the function which actually handles dir or file retrieval
-func (fs *FileServer) handler(w http.ResponseWriter, req *http.Request) {
+func (ws *WebServer) handler(w http.ResponseWriter, req *http.Request) {
 	// Get url so you can extract Headline and title
 	upath := req.URL.Path
 
@@ -238,7 +250,7 @@ func (fs *FileServer) handler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Define absolute path
-	open := fs.Webroot + path.Clean(upath)
+	open := ws.Webroot + path.Clean(upath)
 
 	// Check if you are in a dir
 	// disable G304 (CWE-22): Potential file inclusion via variable
@@ -246,11 +258,11 @@ func (fs *FileServer) handler(w http.ResponseWriter, req *http.Request) {
 	// #nosec G304
 	file, err := os.Open(open)
 	if os.IsNotExist(err) {
-		fs.handleError(w, req, err, http.StatusNotFound)
+		ws.handleError(w, req, err, http.StatusNotFound)
 		return
 	}
 	if os.IsPermission(err) {
-		fs.handleError(w, req, err, http.StatusInternalServerError)
+		ws.handleError(w, req, err, http.StatusInternalServerError)
 		return
 	}
 	if err != nil {
@@ -268,14 +280,14 @@ func (fs *FileServer) handler(w http.ResponseWriter, req *http.Request) {
 	// Switch and check if dir
 	stat, _ := file.Stat()
 	if stat.IsDir() {
-		fs.processDir(w, req, file, upath)
+		ws.processDir(w, req, file, upath)
 	} else {
-		fs.sendFile(w, req, file)
+		ws.sendFile(w, req, file)
 	}
 }
 
 // upload handles the POST request to upload files
-func (fs *FileServer) upload(w http.ResponseWriter, req *http.Request) {
+func (ws *WebServer) upload(w http.ResponseWriter, req *http.Request) {
 	// Get url so you can extract Headline and title
 	upath := req.URL.Path
 
@@ -310,25 +322,25 @@ func (fs *FileServer) upload(w http.ResponseWriter, req *http.Request) {
 		filenameClean := filenameSlice[len(filenameSlice)-1]
 
 		// Construct absolute savepath
-		savepath := fmt.Sprintf("%s%s/%s", fs.Webroot, target, filenameClean)
+		savepath := fmt.Sprintf("%s%s/%s", ws.Webroot, target, filenameClean)
 
 		// Create file to write to
 		if _, err := os.Create(savepath); err != nil {
 			log.Println("ERROR: Not able to create file on disk")
-			fs.handleError(w, req, err, http.StatusInternalServerError)
+			ws.handleError(w, req, err, http.StatusInternalServerError)
 		}
 
 		// Read file from post body
 		fileBytes, err := ioutil.ReadAll(file)
 		if err != nil {
 			log.Println("ERROR: Not able to read file from request")
-			fs.handleError(w, req, err, http.StatusInternalServerError)
+			ws.handleError(w, req, err, http.StatusInternalServerError)
 		}
 
 		// Write file to disk
 		if err := ioutil.WriteFile(savepath, fileBytes, os.ModePerm); err != nil {
 			log.Println("ERROR: Not able to write file to disk")
-			fs.handleError(w, req, err, http.StatusInternalServerError)
+			ws.handleError(w, req, err, http.StatusInternalServerError)
 		}
 
 	}
@@ -341,14 +353,14 @@ func (fs *FileServer) upload(w http.ResponseWriter, req *http.Request) {
 }
 
 // bulkDownload will provide zip archived download bundle of multiple selected files
-func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
+func (ws *WebServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
 	// make slice and query files from request
 	var filesCleaned []string
 	files := req.URL.Query()["file"]
 
 	// Handle if no files are selected
 	if len(files) <= 0 {
-		fs.handleError(w, req, errors.New("You need to select a file before you can download a zip archive"), 404)
+		ws.handleError(w, req, errors.New("You need to select a file before you can download a zip archive"), 404)
 	}
 
 	// Clean file paths and fill slice
@@ -397,11 +409,11 @@ func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
 		// #nosec G307
 		defer file.Close()
 
-		// filepath is fs.Webroot + file relative path
+		// filepath is ws.Webroot + file relative path
 		// this would result in a lot of nested folders
-		// so we are stripping fs.Webroot again from the structure of the zip file
+		// so we are stripping ws.Webroot again from the structure of the zip file
 		// Leaving us with the relative path of the file
-		zippath := strings.ReplaceAll(filepath, fs.Webroot, "")
+		zippath := strings.ReplaceAll(filepath, ws.Webroot, "")
 		f, err := resultZip.Create(zippath[1:])
 		if err != nil {
 			return err
@@ -417,7 +429,7 @@ func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
 
 	// Loop over files and add to zip
 	for _, file := range filesCleaned {
-		err := filepath.Walk(path.Join(fs.Webroot, file), walker)
+		err := filepath.Walk(path.Join(ws.Webroot, file), walker)
 		if err != nil {
 			log.Printf("Error creating zip file: %+v", err)
 		}
@@ -429,11 +441,11 @@ func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (fs *FileServer) processDir(w http.ResponseWriter, req *http.Request, file *os.File, relpath string) {
+func (ws *WebServer) processDir(w http.ResponseWriter, req *http.Request, file *os.File, relpath string) {
 	// Read directory FileInfo
 	fis, err := file.Readdir(-1)
 	if err != nil {
-		fs.handleError(w, req, err, http.StatusNotFound)
+		ws.handleError(w, req, err, http.StatusNotFound)
 		return
 	}
 
@@ -464,7 +476,7 @@ func (fs *FileServer) processDir(w http.ResponseWriter, req *http.Request, file 
 		// Check and resolve symlink
 		if fi.Mode()&os.ModeSymlink != 0 {
 			item.IsSymlink = true
-			item.SymlinkTarget, err = os.Readlink(path.Join(fs.Webroot, relpath, fi.Name()))
+			item.SymlinkTarget, err = os.Readlink(path.Join(ws.Webroot, relpath, fi.Name()))
 			if err != nil {
 				log.Printf("Error resolving symlink: %+v", err)
 			}
@@ -491,7 +503,7 @@ func (fs *FileServer) processDir(w http.ResponseWriter, req *http.Request, file 
 	// Construct directory for template
 	d := &directory{
 		RelPath: relpath,
-		AbsPath: path.Join(fs.Webroot, relpath),
+		AbsPath: path.Join(ws.Webroot, relpath),
 		Content: items,
 	}
 	if relpath != "/" {
@@ -516,8 +528,8 @@ func (fs *FileServer) processDir(w http.ResponseWriter, req *http.Request, file 
 	// Construct template
 	tem := &indexTemplate{
 		Directory:    d,
-		GoshsVersion: fs.Version,
-		Clipboard:    fs.Clipboard,
+		GoshsVersion: ws.SharedConfig.GoshsVersion,
+		Clipboard:    ws.Clipboard,
 	}
 
 	t := template.New("index")
@@ -529,7 +541,7 @@ func (fs *FileServer) processDir(w http.ResponseWriter, req *http.Request, file 
 	}
 }
 
-func (fs *FileServer) sendFile(w http.ResponseWriter, req *http.Request, file *os.File) {
+func (ws *WebServer) sendFile(w http.ResponseWriter, req *http.Request, file *os.File) {
 	// Extract download parameter
 	download := req.URL.Query()
 	if _, ok := download["download"]; ok {
@@ -552,7 +564,7 @@ func (fs *FileServer) sendFile(w http.ResponseWriter, req *http.Request, file *o
 	}
 }
 
-func (fs *FileServer) handleError(w http.ResponseWriter, req *http.Request, err error, status int) {
+func (ws *WebServer) handleError(w http.ResponseWriter, req *http.Request, err error, status int) {
 	// Set header to status
 	w.WriteHeader(status)
 
@@ -565,8 +577,8 @@ func (fs *FileServer) handleError(w http.ResponseWriter, req *http.Request, err 
 	// Construct error for template filling
 	e.ErrorCode = status
 	e.ErrorMessage = err.Error()
-	e.AbsPath = path.Join(fs.Webroot, req.URL.Path)
-	e.GoshsVersion = fs.Version
+	e.AbsPath = path.Join(ws.Webroot, req.URL.Path)
+	e.GoshsVersion = ws.SharedConfig.GoshsVersion
 
 	// Template handling
 	file, err := parcello.Open("templates/error.html")
